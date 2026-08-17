@@ -61,6 +61,26 @@ def crop_mask(positions: torch.Tensor, centre, half, mode: str = "box") -> torch
     return (d.abs() <= h).all(dim=-1)
 
 
+def near_plane_mask(positions: torch.Tensor, cam_pos, cam_target, offset: float = 0.05
+                    ) -> torch.Tensor:
+    """Keep only gaussians in front of a plane just ahead of the camera. -> (N,) bool.
+
+    A camera inside a room is enclosed by the very surfaces it is looking
+    through, and the rasteriser returns an empty or wall-filled frame. Cutting
+    a plane perpendicular to the view direction removes the near wall and
+    nothing else. An axis-aligned box cannot do this: it leaves fragments
+    wherever a wall runs oblique to the axes, which is most real captures.
+
+    Everything is in the splat frame. `offset` pushes the plane slightly ahead
+    of the camera so gaussians straddling it do not clip into the lens.
+    """
+    p = torch.as_tensor(cam_pos, device=positions.device, dtype=positions.dtype)
+    t = torch.as_tensor(cam_target, device=positions.device, dtype=positions.dtype)
+    d = t - p
+    d = d / d.norm().clamp_min(1e-8)
+    return (positions - (p + d * float(offset))) @ d > 0
+
+
 def enclosing_radius(positions: torch.Tensor, centre, q: float = 0.995):
     """Distance from `centre` that actually contains the splat.
 
@@ -724,3 +744,165 @@ def tonemap(rgb: torch.Tensor, exposure: float = 1.0, mode: str = "aces") -> tor
     # Narkowicz ACES approximation
     a, b, cc, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
     return ((c * (a * c + b)) / (c * (cc * c + d) + e)).clamp(0.0, 1.0)
+
+
+# --------------------------------------------------------------------------
+# multi-view back-projection: writing 2D image results onto 3D gaussians
+# --------------------------------------------------------------------------
+#
+# A splat has no UV atlas, so an image model's output cannot be "unwrapped"
+# onto it. It does not need to be: every gaussian is seen from many cameras,
+# so the gaussians themselves are the atlas. Render N views, run the model per
+# view, then for each gaussian gather the pixel it lands on in every view and
+# average - weighted by whether it was actually visible there and how squarely
+# it faced that camera.
+#
+# The weighting is what makes this work rather than smear. A gaussian hidden
+# behind a wall in view 7 still projects to some pixel in view 7; without a
+# visibility term it would collect that unrelated colour.
+
+def camera_basis(cam_pos, cam_target, device=None, dtype=torch.float32):
+    """Orthonormal (right, up, forward) plus position for a camera, splat frame.
+
+    The splat frame is Y-down, so the world-up hint is -Y.
+    """
+    p = torch.as_tensor(cam_pos, device=device, dtype=dtype)
+    t = torch.as_tensor(cam_target, device=device, dtype=dtype)
+    fwd = t - p
+    fwd = fwd / fwd.norm().clamp_min(1e-8)
+    up_hint = torch.tensor([0.0, -1.0, 0.0], device=fwd.device, dtype=dtype)
+    if (fwd @ up_hint).abs() > 0.999:                   # looking straight up or down
+        up_hint = torch.tensor([0.0, 0.0, 1.0], device=fwd.device, dtype=dtype)
+    right = torch.cross(fwd, up_hint, dim=-1)
+    right = right / right.norm().clamp_min(1e-8)
+    up = torch.cross(right, fwd, dim=-1)
+    return right, up, fwd, p
+
+
+def project(positions, cam_pos, cam_target, fov_deg, width, height):
+    """Perspective-project gaussians into a camera.
+
+    Returns (px, py, depth, inside) with px/py in float pixel coordinates and
+    `inside` true where the gaussian is in front of the camera and on screen.
+    """
+    right, up, fwd, p = camera_basis(cam_pos, cam_target, positions.device, positions.dtype)
+    d = positions - p
+    z = d @ fwd
+    focal = (float(height) * 0.5) / math.tan(math.radians(float(fov_deg)) * 0.5)
+    safe = z.clamp_min(1e-6)
+    px = (d @ right) / safe * focal + float(width) * 0.5
+    py = -(d @ up) / safe * focal + float(height) * 0.5
+    inside = (z > 1e-3) & (px >= 0) & (px <= width - 1) & (py >= 0) & (py <= height - 1)
+    return px, py, z, inside
+
+
+def sample_image(image, px, py):
+    """Bilinearly sample an (H,W,C) image at float pixel coords -> (N,C)."""
+    h, w = image.shape[0], image.shape[1]
+    x = px.clamp(0, w - 1)
+    y = py.clamp(0, h - 1)
+    x0 = x.floor().long().clamp(0, w - 1); x1 = (x0 + 1).clamp(0, w - 1)
+    y0 = y.floor().long().clamp(0, h - 1); y1 = (y0 + 1).clamp(0, h - 1)
+    fx = (x - x0.to(x.dtype))[:, None]
+    fy = (y - y0.to(y.dtype))[:, None]
+    flat = image.reshape(-1, image.shape[2])
+    g = lambda yy, xx: flat[yy * w + xx]
+    top = g(y0, x0) * (1 - fx) + g(y0, x1) * fx
+    bot = g(y1, x0) * (1 - fx) + g(y1, x1) * fx
+    return top * (1 - fy) + bot * fy
+
+
+def view_weight(positions, normals, cam_pos, cam_target, fov_deg, width, height,
+                grid=None, sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06):
+    """How far a gaussian's sample from one camera should be trusted. -> (N,) >= 0
+
+    Three independent terms, each a real failure mode:
+      * on screen and in front of the camera, with a soft fade at the frame
+        edge so a gaussian does not pop as it crosses between views
+      * facing the camera - a surfel seen edge-on covers almost no pixels, so
+        its sample is unreliable
+      * visible - ray-march the density field from the surface to the camera.
+        Without this, geometry hidden behind a wall still projects to a pixel
+        and would collect a completely unrelated colour.
+    """
+    px, py, z, inside = project(positions, cam_pos, cam_target, fov_deg, width, height)
+    w = inside.to(positions.dtype)
+
+    if edge_fade > 0:
+        fx = (px / max(width - 1, 1)).clamp(0, 1)
+        fy = (py / max(height - 1, 1)).clamp(0, 1)
+        m = float(edge_fade)
+        fade = (fx.clamp(0, m) / m) * ((1 - fx).clamp(0, m) / m) \
+             * (fy.clamp(0, m) / m) * ((1 - fy).clamp(0, m) / m)
+        w = w * fade.clamp(0, 1)
+
+    right, up, fwd, p = camera_basis(cam_pos, cam_target, positions.device, positions.dtype)
+    to_cam = p - positions
+    dist = to_cam.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    dir_cam = to_cam / dist
+    if normals is not None:
+        facing = (normals * dir_cam).sum(-1).abs()      # abs: surfel orientation is arbitrary
+        w = w * (facing - min_facing).clamp_min(0.0) / max(1.0 - min_facing, 1e-6)
+
+    if grid is not None:
+        eps = grid.voxel_size * 1.5
+        origin = positions + dir_cam * eps
+        reach = (dist.reshape(-1) - eps).clamp_min(0.0)
+        vis = torch.ones_like(w)
+        far = reach > 1e-4
+        if far.any():
+            vis[far] = grid.transmittance(origin[far], dir_cam[far],
+                                          float(reach[far].max()), steps=steps, sigma=sigma)
+        w = w * vis
+    return w.clamp_min(0.0)
+
+
+def backproject(images, cameras, positions, normals=None, grid=None, fov_deg=55.0,
+                sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06):
+    """Gather per-gaussian values from a set of rendered views.
+
+    `images`  : list of (H,W,C) tensors, one per view, all sharing C
+    `cameras` : list of (cam_pos, cam_target) in the splat frame
+
+    Returns (values (N,C), coverage (N,)). Coverage is the summed weight, so
+    zero means the gaussian was never reliably seen and its value is a fallback
+    rather than a measurement - callers must not treat those as data.
+    """
+    n = positions.shape[0]
+    c = images[0].shape[2]
+    num = torch.zeros(n, c, device=positions.device, dtype=positions.dtype)
+    den = torch.zeros(n, device=positions.device, dtype=positions.dtype)
+    for img, (cp, ct) in zip(images, cameras):
+        h, w = img.shape[0], img.shape[1]
+        wt = view_weight(positions, normals, cp, ct, fov_deg, w, h,
+                         grid=grid, sigma=sigma, steps=steps,
+                         min_facing=min_facing, edge_fade=edge_fade)
+        hit = wt > 1e-6
+        if not bool(hit.any()):
+            continue
+        px, py, _, _ = project(positions, cp, ct, fov_deg, w, h)
+        vals = sample_image(img.to(positions.dtype), px[hit], py[hit])
+        num[hit] += vals * wt[hit][:, None]
+        den[hit] += wt[hit]
+    good = den > 1e-6
+    out = torch.zeros_like(num)
+    out[good] = num[good] / den[good][:, None]
+    return out, den
+
+
+def orbit_cameras(centre, radius, count=24, pitch_deg=18.0):
+    """Cameras evenly spaced on a ring around `centre`, in the splat frame.
+
+    Returns a list of (position, target).
+    """
+    out = []
+    c = [float(v) for v in centre]
+    pitch = math.radians(float(pitch_deg))
+    for i in range(int(count)):
+        a = 2.0 * math.pi * i / float(count)
+        # splat frame is Y-down, so a positive pitch lifts the camera toward -Y
+        pos = [c[0] + radius * math.cos(pitch) * math.sin(a),
+               c[1] - radius * math.sin(pitch),
+               c[2] + radius * math.cos(pitch) * math.cos(a)]
+        out.append((pos, list(c)))
+    return out

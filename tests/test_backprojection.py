@@ -376,10 +376,113 @@ def test_soft_shadow_mask():
           f"(alpha {aw[100,200]:.2f}) - context must exceed the shadow")
 
 
+def test_composite_fill():
+    """Frequency-split compositing must hide the seam without losing texture."""
+    print("frequency-split composite")
+    torch.manual_seed(3)
+    H, W = 200, 200
+    tex = torch.rand(H, W, 3) * 0.25 + 0.4                 # detailed surface
+    orig = tex.clone()
+    orig[:, :100] *= 0.35                                   # left half in shadow
+    core = torch.zeros(H, W)
+    core[:, 20:80] = 1.0                                    # fill only part of it
+    fill = tex.clone() * 1.02                               # a good, brighter fill
+
+    out = rc.composite_fill(orig, fill, core, ramp_sigma=12.0)
+    check(tuple(out.shape) == (H, W, 3), "shape is preserved")
+    check(bool(torch.isfinite(out).all()), "output is finite")
+
+    hp = lambda a: (rc.luminance(a) - rc.blur2d(rc.luminance(a), 2.0))
+    far = (slice(None), slice(140, 200))
+    check(torch.allclose(hp(out)[far], hp(orig)[far], atol=1e-5),
+          "high frequencies far from the core are identical to the original")
+
+    # the whole point: brightness must be corrected inside the core
+    lit = rc.luminance(orig)[:, 150:].mean()
+    before = rc.luminance(orig)[:, 40:60].mean()
+    after = rc.luminance(out)[:, 40:60].mean()
+    check(after > before * 1.5, f"the core is brightened ({before:.3f} -> {after:.3f})")
+
+    # texture inside the core must not collapse
+    t_in_o = hp(orig)[:, 40:60].std()
+    t_in_n = hp(out)[:, 40:60].std()
+    check(t_in_n > t_in_o * 0.8,
+          f"texture survives inside the core ({t_in_o:.4f} -> {t_in_n:.4f})")
+
+    # a WIDER ramp must not cost any texture outside the core - the property
+    # the naive alpha blend failed, at 27.6% detail loss
+    # A gaussian is not a perfect low-pass, so a very wide ramp leaks a trace of
+    # high frequency. Assert it stays negligible against the texture it sits on,
+    # rather than bit-exact: measured 0.25% at sigma 40, against the 27.6% loss
+    # the naive alpha blend caused.
+    wide = rc.composite_fill(orig, fill, core, ramp_sigma=40.0)
+    leak = float((hp(wide)[far] - hp(orig)[far]).abs().max())
+    scale = float(hp(orig)[far].std())
+    check(leak < scale * 0.01,
+          f"a wide lighting ramp leaks <1% of texture magnitude ({100*leak/scale:.3f}%)")
+    e12 = float((rc.luminance(out)[:, 95:105] - rc.luminance(out)[:, 85:95]).abs().mean())
+    e40 = float((rc.luminance(wide)[:, 95:105] - rc.luminance(wide)[:, 85:95]).abs().mean())
+    check(e40 <= e12 + 1e-4, f"a wider ramp softens the step at least as much ({e12:.4f} -> {e40:.4f})")
+
+    # A full core with a full ramp must reproduce the fill EXACTLY. This is what
+    # catches an inconsistent frequency split: with two different sigmas the
+    # mid-band is double-counted and this identity quietly fails.
+    allc = torch.ones(H, W)
+    exact = rc.composite_fill(orig, fill, allc, ramp_sigma=4.0)
+    err = float((exact - fill).abs().max())
+    check(err < 1e-4, f"a full core reproduces the fill exactly (max err {err:.2e})")
+
+    # A NARROW core must still receive the full lighting correction. A plain
+    # blurred ramp peaks well below 1 on a thin region, leaving it darker than
+    # the fill it was handed.
+    thin = torch.zeros(H, W)
+    thin[:, 96:104] = 1.0                                   # 8px wide
+    tout = rc.composite_fill(orig, fill, thin, ramp_sigma=20.0)
+    want = rc.luminance(fill)[:, 98:102].mean()
+    got = rc.luminance(tout)[:, 98:102].mean()
+    check(abs(float(got - want)) < 0.02,
+          f"a thin core still reaches the fill's brightness ({got:.3f} vs {want:.3f})")
+
+    # an all-zero core must be a no-op
+    noop = rc.composite_fill(orig, fill, torch.zeros(H, W), ramp_sigma=12.0)
+    check(torch.allclose(noop, orig, atol=1e-5), "an empty core leaves the original untouched")
+
+
+def test_contact_taper():
+    """Contact occlusion near objects must be preserved, not filled."""
+    print("contact taper")
+    H, W = 160, 160
+    obj = torch.zeros(H, W)
+    obj[:, 100:] = 1.0                       # an object occupying the right half
+    core = torch.ones(H, W)                  # naively fill everything
+
+    t = rc.contact_taper(core, obj, taper_px=20)
+    check(t[80, 10].item() > 0.95, "far from the object the fill is untouched")
+    check(t[80, 95].item() < 0.5, f"right at the object the fill is suppressed ({t[80,95]:.2f})")
+    check(bool((t <= core + 1e-6).all()), "tapering can only reduce a mask, never grow it")
+    check(bool(((t >= 0) & (t <= 1)).all()), "output stays in [0,1]")
+
+    # monotonic: further from the object means more fill
+    prof = [t[80, x].item() for x in (60, 70, 80, 90)]
+    check(all(prof[i] >= prof[i+1] - 1e-6 for i in range(len(prof)-1)),
+          f"suppression increases monotonically toward the object ({[round(v,2) for v in prof]})")
+
+    # a wider taper protects more
+    t2 = rc.contact_taper(core, obj, taper_px=40)
+    check(t2.sum().item() < t.sum().item(), "a wider taper protects a wider band")
+    check(t2[80, 10].item() > 0.9, "a wider taper still leaves distant fill alone")
+
+    # zero taper is a no-op, and no object means nothing to protect
+    check(torch.equal(rc.contact_taper(core, obj, taper_px=0), core),
+          "taper 0 is an exact no-op")
+    none = rc.contact_taper(core, torch.zeros(H, W), taper_px=20)
+    check(torch.allclose(none, core, atol=1e-6), "with no objects the mask is unchanged")
+
+
 def main():
     for fn in [test_projection_geometry, test_sample_image, test_near_plane_cut,
                test_backproject_constant_recovery, test_backproject_weighting,
-               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask, test_split_fill_mask, test_soft_shadow_mask]:
+               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask, test_split_fill_mask, test_soft_shadow_mask, test_composite_fill, test_contact_taper]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:

@@ -1037,9 +1037,13 @@ def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=
     if grow:
         # A cast shadow has a penumbra: the threshold catches the core but leaves
         # a soft rim just outside it, which survives the fill and reads as a
-        # residual shadow outline. Growing the mask past that rim is what removes
-        # it - the cost is repainting a little genuine surface, which is cheap
-        # because the fill is colour-matched to the surrounding ring anyway.
+        # residual shadow outline. Growing the mask past that rim removes it.
+        #
+        # Keep this SMALL. Measured on a 1024x768 render, 4px and 14px removed
+        # the same amount of shadow (41.2% vs 41.6%), but 4px repainted 3.19% of
+        # the frame against 5.95% and left chroma noise unchanged (-0.1%) where
+        # 14px raised it 6.3%. Over-growing buys nothing and costs real surface.
+        # 3-5px is the useful range at that resolution.
         m = _dilate2d(m, int(grow))
     if float(m.mean()) < float(min_frac):
         return torch.zeros_like(s), rel

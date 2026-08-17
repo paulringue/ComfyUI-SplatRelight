@@ -236,6 +236,20 @@ def test_shadow_mask():
     check(rc.blur2d(torch.ones(16, 16), 2.0).std().item() < 1e-5,
           "blurring a constant field leaves it constant")
 
+    # growing must strictly expand, never shrink, and must reach the penumbra
+    base, _ = rc.shadow_mask(s, ratio=0.62, context=25.0, feather=0.0, grow=0)
+    g8, _ = rc.shadow_mask(s, ratio=0.62, context=25.0, feather=0.0, grow=8)
+    check(g8.sum().item() > base.sum().item(), "grow expands the mask")
+    check(bool((g8 >= base - 1e-6).all()), "grow never removes anything already masked")
+    a = float(base.sum()); b = float(g8.sum())
+    check(b > a * 1.2, f"grow=8 meaningfully widens the region ({a:.0f} -> {b:.0f} px)")
+    # the grown mask must extend beyond the original edge on every side
+    ys, xs = torch.where(base > 0.5)
+    ys2, xs2 = torch.where(g8 > 0.5)
+    check(int(xs2.min()) < int(xs.min()) and int(xs2.max()) > int(xs.max())
+          and int(ys2.min()) < int(ys.min()) and int(ys2.max()) > int(ys.max()),
+          "grow extends past the original boundary on all four sides")
+
 
 def test_flat_region_mask():
     """A fill must be kept away from object silhouettes."""

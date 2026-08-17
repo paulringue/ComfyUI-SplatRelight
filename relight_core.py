@@ -1013,7 +1013,7 @@ def _erode2d(m, r):
 
 
 def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=3.0,
-                min_frac=0.001):
+                min_frac=0.001, grow=0):
     """Where is a pixel shadowed *relative to its surroundings*? -> ((H,W) in [0,1], ratio map)
 
     `shading` : (H,W) or (H,W,3) diffuse shading, any scale - it is normalised here
@@ -1034,6 +1034,13 @@ def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=
         m = _dilate2d(_erode2d(m, int(open_r)), int(open_r))
     if close_r:
         m = _erode2d(_dilate2d(m, int(close_r)), int(close_r))
+    if grow:
+        # A cast shadow has a penumbra: the threshold catches the core but leaves
+        # a soft rim just outside it, which survives the fill and reads as a
+        # residual shadow outline. Growing the mask past that rim is what removes
+        # it - the cost is repainting a little genuine surface, which is cheap
+        # because the fill is colour-matched to the surrounding ring anyway.
+        m = _dilate2d(m, int(grow))
     if float(m.mean()) < float(min_frac):
         return torch.zeros_like(s), rel
     if feather > 0:

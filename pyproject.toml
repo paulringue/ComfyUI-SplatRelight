@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-splatrelight"
+description = "Relight animated 3D gaussian splats in ComfyUI: delight a capture, build a light rig, and re-shade the gaussians themselves with PBR, self-shadowing and HDRI environment lighting."
+version = "1.17.0"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/paulringue/ComfyUI-SplatRelight"
+
+[tool.comfy]
+PublisherId = "paulringue"
+DisplayName = "Splat Relight"
+Icon = ""
+requires-comfyui = ">=0.23.0"

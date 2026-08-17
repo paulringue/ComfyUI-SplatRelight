@@ -969,3 +969,73 @@ def orbit_cameras(centre, radius, count=24, pitch_deg=18.0):
                c[2] + radius * math.cos(pitch) * math.cos(a)]
         out.append((pos, list(c)))
     return out
+
+
+# --------------------------------------------------------------------------
+# shadow masking: pointing a generative fill at shading rather than albedo
+# --------------------------------------------------------------------------
+#
+# Lifting a baked shadow cannot work where the shadow is deep: the capture
+# recorded almost no signal there, and dividing near-zero by anything is still
+# near-zero. Regenerating that region is the only route that can put detail
+# back, which makes the mask the critical part - point a generative fill at
+# dark *paint* instead of dark *shading* and it erases real material.
+#
+# Marigold's diffuse shading is the right source: measured on a real capture it
+# accounted for ~95% of the shadow in image space while carrying no albedo, so
+# a grimy dark floor stain is correctly ignored while the shadow beside it is
+# selected.
+
+def _gaussian_kernel1d(sigma, device, dtype=torch.float32):
+    r = int(float(sigma) * 3) | 1
+    x = torch.arange(-(r // 2), r // 2 + 1, device=device, dtype=dtype)
+    k = torch.exp(-x * x / (2.0 * float(sigma) ** 2))
+    return k / k.sum(), r // 2
+
+
+def blur2d(x, sigma):
+    """Separable gaussian blur of a (H,W) tensor."""
+    k, p = _gaussian_kernel1d(sigma, x.device, x.dtype)
+    t = x[None, None]
+    t = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(t, (p, p, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    t = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(t, (0, 0, p, p), mode="replicate"), k.view(1, 1, -1, 1))
+    return t[0, 0]
+
+
+def _dilate2d(m, r):
+    return torch.nn.functional.max_pool2d(m[None, None], 2 * r + 1, stride=1, padding=r)[0, 0]
+
+
+def _erode2d(m, r):
+    return -torch.nn.functional.max_pool2d(-m[None, None], 2 * r + 1, stride=1, padding=r)[0, 0]
+
+
+def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=3.0,
+                min_frac=0.001):
+    """Where is a pixel shadowed *relative to its surroundings*? -> ((H,W) in [0,1], ratio map)
+
+    `shading` : (H,W) or (H,W,3) diffuse shading, any scale - it is normalised here
+    `ratio`   : below this fraction of the local mean counts as shadow
+    `context` : blur sigma defining "local". Must be much wider than the shadow,
+                or the shadow drags down its own reference and hides itself.
+
+    Relative rather than absolute, because a genuinely dark surface in full
+    light is not a shadow and must not be regenerated. Open then close removes
+    speckle and fills pinholes; the final blur feathers the edge so a fill
+    blends instead of seaming.
+    """
+    s = shading if shading.dim() == 2 else luminance(shading)
+    s = s.float().clamp_min(1e-4)
+    rel = s / blur2d(s, context).clamp_min(1e-4)
+    m = (rel < float(ratio)).float()
+    if open_r:
+        m = _dilate2d(_erode2d(m, int(open_r)), int(open_r))
+    if close_r:
+        m = _erode2d(_dilate2d(m, int(close_r)), int(close_r))
+    if float(m.mean()) < float(min_frac):
+        return torch.zeros_like(s), rel
+    if feather > 0:
+        m = blur2d(m, feather).clamp(0, 1)
+    return m, rel

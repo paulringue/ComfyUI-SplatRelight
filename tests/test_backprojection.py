@@ -199,10 +199,48 @@ def test_orbit_cameras():
     check(len(az) == 12, "cameras are at distinct azimuths")
 
 
+def test_shadow_mask():
+    """The mask must select relative darkness, not dark material."""
+    print("shadow mask")
+    H, W = 128, 128
+    # uniform shading with one darkened patch = a shadow
+    s = torch.ones(H, W)
+    s[40:70, 30:80] = 0.35
+    m, rel = rc.shadow_mask(s, ratio=0.62, context=25.0, feather=0.0)
+    inside = m[48:62, 40:70].mean().item()
+    outside = torch.cat([m[:30].reshape(-1), m[100:].reshape(-1)]).mean().item()
+    check(inside > 0.9, f"the darkened patch is selected ({inside:.2f})")
+    check(outside < 0.02, f"unshadowed area is not selected ({outside:.3f})")
+
+    # a uniformly dark image has no *relative* shadow - nothing may be selected
+    flat = torch.full((H, W), 0.15)
+    m2, _ = rc.shadow_mask(flat, ratio=0.62, context=25.0, feather=0.0)
+    check(m2.mean().item() < 1e-6,
+          f"uniformly dark shading selects nothing ({m2.mean():.4f}) - dark paint is not shadow")
+
+    # scale invariance: shading is up_to_scale, so 10x input must give the same mask
+    m3, _ = rc.shadow_mask(s * 10.0, ratio=0.62, context=25.0, feather=0.0)
+    check(torch.equal(m2 * 0 + m3, m), "mask is invariant to the shading's arbitrary scale")
+
+    # a (H,W,3) input must behave like its luminance
+    m4, _ = rc.shadow_mask(s[..., None].expand(-1, -1, 3).contiguous(),
+                           ratio=0.62, context=25.0, feather=0.0)
+    check(torch.equal(m4, m), "colour shading input matches the luminance path")
+
+    # feathering must soften the edge without moving the interior
+    mf, _ = rc.shadow_mask(s, ratio=0.62, context=25.0, feather=3.0)
+    check(mf[48:62, 40:70].mean().item() > 0.9, "feathering leaves the interior filled")
+    check(float(((mf > 0.01) & (mf < 0.99)).sum()) > float(((m > 0.01) & (m < 0.99)).sum()),
+          "feathering creates a soft border")
+
+    check(rc.blur2d(torch.ones(16, 16), 2.0).std().item() < 1e-5,
+          "blurring a constant field leaves it constant")
+
+
 def main():
     for fn in [test_projection_geometry, test_sample_image, test_near_plane_cut,
                test_backproject_constant_recovery, test_backproject_weighting,
-               test_backproject_occlusion, test_orbit_cameras]:
+               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:

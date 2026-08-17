@@ -328,10 +328,58 @@ def test_split_fill_mask():
     check(float(ge.sum()) == 0 and float(be.sum()) == 0, "an empty region yields empty masks")
 
 
+def test_soft_shadow_mask():
+    """Softness must come from the shadow's own gradient, not a chosen radius."""
+    print("soft shadow mask")
+    H, W = 200, 400
+    CTX = 40.0
+    # Shadows must be SMALL relative to the context blur, or each one drags down
+    # its own reference and never reaches full alpha. Two narrow bars, far apart,
+    # so each ramp can be measured against clean surface on one side only.
+    s = torch.ones(H, W)
+    s[80:120, 60:80] = 0.30                                    # crisp step
+    ramp = torch.linspace(0.30, 1.0, 40)                       # 40px falloff
+    s[80:120, 260:300] = ramp[None, :].expand(40, -1)
+    a, rel = rc.soft_shadow_mask(s, ratio_full=0.50, ratio_none=0.82, context=CTX)
+
+    check(a[100, 68].item() > 0.9,
+          f"the crisp shadow core is fully masked (alpha {a[100,68]:.2f})")
+    check(a[10, 10].item() < 0.05, "clean surface away from any shadow is untouched")
+    check(a[100, 200].item() < 0.05, "clean surface between the two shadows is untouched")
+    check(bool(((a >= 0) & (a <= 1)).all()), "alpha stays within [0,1]")
+
+    # ramp width measured outward from each shadow's right edge only
+    crisp = int(((a[100, 80:120] > 0.05) & (a[100, 80:120] < 0.95)).sum())
+    soft = int(((a[100, 262:340] > 0.05) & (a[100, 262:340] < 0.95)).sum())
+    check(soft > crisp,
+          f"the gradual shadow gets a wider ramp than the crisp one ({soft} vs {crisp} px)")
+    check(crisp < 15, f"a crisp edge is not expanded arbitrarily ({crisp} px of ramp)")
+
+    # widening the ratio band widens the ramp without unseating the core
+    a2, _ = rc.soft_shadow_mask(s, ratio_full=0.50, ratio_none=0.95, context=CTX)
+    soft2 = int(((a2[100, 262:340] > 0.05) & (a2[100, 262:340] < 0.95)).sum())
+    check(soft2 >= soft, f"a wider ratio band widens the transition ({soft2} vs {soft})")
+    check(a2[100, 68].item() > 0.9, "the core stays fully masked regardless")
+
+    # uniformly dark shading is not a shadow at all
+    flat, _ = rc.soft_shadow_mask(torch.full((H, W), 0.2), context=CTX)
+    check(float((flat > 0.5).float().mean()) < 1e-6,
+          "uniformly dark shading yields no shadow")
+
+    # a shadow wide against the context blur cannot reach full alpha - the
+    # documented failure mode, pinned so it is a known property not a surprise
+    wide = torch.ones(H, W)
+    wide[:, 100:300] = 0.30
+    aw, _ = rc.soft_shadow_mask(wide, ratio_full=0.50, ratio_none=0.82, context=CTX)
+    check(aw[100, 200].item() < 0.9,
+          f"a shadow wider than the context blur under-masks its core "
+          f"(alpha {aw[100,200]:.2f}) - context must exceed the shadow")
+
+
 def main():
     for fn in [test_projection_geometry, test_sample_image, test_near_plane_cut,
                test_backproject_constant_recovery, test_backproject_weighting,
-               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask, test_split_fill_mask]:
+               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask, test_split_fill_mask, test_soft_shadow_mask]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:

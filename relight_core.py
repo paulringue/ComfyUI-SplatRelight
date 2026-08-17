@@ -1039,11 +1039,12 @@ def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=
         # a soft rim just outside it, which survives the fill and reads as a
         # residual shadow outline. Growing the mask past that rim removes it.
         #
-        # Keep this SMALL. Measured on a 1024x768 render, 4px and 14px removed
-        # the same amount of shadow (41.2% vs 41.6%), but 4px repainted 3.19% of
-        # the frame against 5.95% and left chroma noise unchanged (-0.1%) where
-        # 14px raised it 6.3%. Over-growing buys nothing and costs real surface.
-        # 3-5px is the useful range at that resolution.
+        # Prefer 0. Measured on a 1024x768 render, growing bought almost nothing:
+        # 4px and 14px removed the same shadow (41.2% vs 41.6%) while 14px cost
+        # nearly twice the footprint. And a tight mask (grow=0) with the
+        # generator's strength lowered to 0.7-0.85 beat every grown variant -
+        # texture within +6% of the original against -27.6% for grow+blur.
+        # Reach for lower strength before reaching for a wider mask.
         m = _dilate2d(m, int(grow))
     if float(m.mean()) < float(min_frac):
         return torch.zeros_like(s), rel
@@ -1127,13 +1128,17 @@ def split_fill_mask(core, blend_sigma=8.0, gen_margin=None):
     `gen_margin` defaults to 3*blend_sigma, the blur's practical reach, so the
     ramp is fully contained by construction rather than by luck.
 
-    MEASURED: sigma 8 is the sweet spot at 1024x768. Gradient energy across the
-    mask boundary, where a seam shows, went 0.0418 with a hard edge to 0.0312 at
-    sigma 8 - and its 99th percentile, 0.1852, fell *below* the untouched
-    original's own 0.1899, i.e. the seam stopped being the sharpest thing there.
-    Sigma 16 was worse on every count (0.0322 seam, 34.5%% shadow removed vs
-    43.0%%) because the generate mask balloons to 23.6%% of the frame and the
-    model starts replacing the real context that anchors the fill.
+    USE SPARINGLY, AND MEASURE TEXTURE, NOT JUST THE SEAM. A wide ramp does hide
+    the boundary - at 1024x768 sigma 8 took boundary gradient from 0.0418 to
+    0.0312, below the untouched original's own 0.1899 at the 99th percentile.
+    But measured inside the fill in a proper 2D window, that same setting
+    DESTROYED 27.6%% of the texture, because the ramp partially replaces real
+    pixels with the model's smoother output across a wide band. It was the only
+    variant tested that lost texture at all.
+    Lowering the generator's strength to 0.7-0.85 with a TIGHT mask beat it
+    outright: texture within +6%% of the original, a third of the footprint, and
+    nearly the same shadow removal. Fix fill quality before widening the mask;
+    a wide ramp mostly smears the boundary of a bad fill.
     """
     c = core if core.dim() == 2 else luminance(core)
     c = c.float().clamp(0, 1)
@@ -1143,3 +1148,34 @@ def split_fill_mask(core, blend_sigma=8.0, gen_margin=None):
     gen = _dilate2d(hard, margin) if margin > 0 else hard
     blend = (blur2d(hard, sig) * gen).clamp(0, 1)
     return gen, blend
+
+
+def soft_shadow_mask(shading, ratio_full=0.50, ratio_none=0.82, context=45.0,
+                     open_r=0, min_frac=0.001):
+    """A shadow mask whose softness IS the penumbra's own softness. -> ((H,W), rel)
+
+    The alternative to threshold-then-dilate-then-blur. That pipeline needs two
+    arbitrary radii, and both cost real surface: dilation expands in every
+    direction whether or not there is shadow there, and the blur then partially
+    replaces a further ring of untouched capture.
+
+    Here the alpha ramps with the measured shading ratio instead:
+        rel <= ratio_full  ->  1   (definitely shadow)
+        rel >= ratio_none  ->  0   (definitely not)
+    so the transition is narrow where the shadow edge is crisp and wide where it
+    is genuinely soft. The mask follows the physics rather than a chosen radius,
+    and its footprint is only as large as the shadow actually is.
+    """
+    s = shading if shading.dim() == 2 else luminance(shading)
+    s = s.float().clamp_min(1e-4)
+    rel = s / blur2d(s, context).clamp_min(1e-4)
+    lo, hi = float(ratio_full), float(ratio_none)
+    if hi <= lo:
+        hi = lo + 1e-3
+    a = ((hi - rel) / (hi - lo)).clamp(0.0, 1.0)
+    if open_r:                      # optional speckle removal on the solid core
+        core = _dilate2d(_erode2d((a > 0.9).float(), int(open_r)), int(open_r))
+        a = a * torch.maximum(core, (a < 0.9).float())
+    if float((a > 0.5).float().mean()) < float(min_frac):
+        return torch.zeros_like(s), rel
+    return a, rel

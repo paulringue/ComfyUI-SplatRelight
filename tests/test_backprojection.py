@@ -162,16 +162,24 @@ def test_backproject_occlusion():
     grid = rc.DensityGrid(pos, op, sc, resolution=64)
 
     cam = ([0.0, 0.0, -4.0], [0.0, 0.0, 1.0])           # slab sits between camera and target
-    w = rc.view_weight(target, None, cam[0], cam[1], 60.0, 64, 64, grid=grid, sigma=40.0)
-    w_nogrid = rc.view_weight(target, None, cam[0], cam[1], 60.0, 64, 64, grid=None)
-    check(w_nogrid[0].item() > 0.5, "without a grid the hidden gaussian is naively weighted")
-    check(w[0].item() < w_nogrid[0].item() * 0.5,
-          f"the occluding slab cuts the weight ({w_nogrid[0]:.3f} -> {w[0]:.3f})")
+    # the depth buffer has to be built from the WHOLE scene, not the query subset
+    buf = rc.depth_buffer(pos, cam[0], cam[1], 60.0, 64, 64, op)
+    w = rc.view_weight(target, None, cam[0], cam[1], 60.0, 64, 64, depth_buf=buf)
+    w_off = rc.view_weight(target, None, cam[0], cam[1], 60.0, 64, 64, use_zbuffer=False)
+    check(w_off[0].item() > 0.5, "with occlusion disabled the hidden gaussian is naively weighted")
+    check(w[0].item() < 1e-6,
+          f"the occluding slab rejects it outright ({w_off[0]:.3f} -> {w[0]:.3f})")
 
     behind = ([0.0, 0.0, 4.0], [0.0, 0.0, 1.0])         # same side, nothing in the way
-    w2 = rc.view_weight(target, None, behind[0], behind[1], 60.0, 64, 64, grid=grid, sigma=40.0)
+    buf2 = rc.depth_buffer(pos, behind[0], behind[1], 60.0, 64, 64, op)
+    w2 = rc.view_weight(target, None, behind[0], behind[1], 60.0, 64, 64, depth_buf=buf2)
     check(w2[0].item() > w[0].item(),
-          f"an unobstructed camera keeps far more weight ({w[0]:.3f} vs {w2[0]:.3f})")
+          f"an unobstructed camera keeps the weight ({w[0]:.3f} vs {w2[0]:.3f})")
+
+    # a gaussian buried *inside* the slab must also be rejected from the front
+    inside_slab = torch.tensor([[0.0, 0.0, 0.30]])
+    w3 = rc.view_weight(inside_slab, None, cam[0], cam[1], 60.0, 64, 64, depth_buf=buf)
+    check(w3[0].item() < 1e-6, "geometry behind the first surface is rejected")
 
 
 def test_orbit_cameras():

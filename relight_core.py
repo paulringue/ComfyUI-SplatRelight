@@ -812,8 +812,55 @@ def sample_image(image, px, py):
     return top * (1 - fy) + bot * fy
 
 
+def depth_buffer(positions, cam_pos, cam_target, fov_deg, width, height, opacities=None,
+                 min_opacity=0.25):
+    """Nearest depth per pixel, splatted from the gaussians. -> (H*W,) float
+
+    Empty pixels hold +inf. This is an exact occlusion test, unlike marching the
+    density grid, which answers "roughly how much stuff is in the way" and on a
+    real capture passes surfaces several metres apart as equally visible.
+    """
+    px, py, z, inside = project(positions, cam_pos, cam_target, fov_deg, width, height)
+    keep = inside
+    if opacities is not None:
+        keep = keep & (opacities.reshape(-1) > float(min_opacity))
+    buf = torch.full((height * width,), float("inf"), device=positions.device,
+                     dtype=positions.dtype)
+    if not bool(keep.any()):
+        return buf
+    idx = py[keep].long() * width + px[keep].long()
+    buf.scatter_reduce_(0, idx, z[keep], reduce="amin", include_self=True)
+    return buf
+
+
+def surface_mask(positions, cam_pos, cam_target, fov_deg, width, height, opacities=None,
+                 tol=0.05, rel_tol=0.02, min_opacity=0.25, buf=None):
+    """Which gaussians form the first visible surface from this camera. -> (N,) bool
+
+    A gaussian passes if its depth is within tolerance of the nearest depth
+    recorded at the pixel it lands on. Everything behind that - the far wall
+    seen "through" the near one, geometry inside a cupboard - is rejected.
+
+    Tolerance is absolute plus a fraction of depth, because a splat's surface
+    has real thickness and projected error grows with distance.
+    """
+    px, py, z, inside = project(positions, cam_pos, cam_target, fov_deg, width, height)
+    if buf is None:
+        buf = depth_buffer(positions, cam_pos, cam_target, fov_deg, width, height,
+                           opacities, min_opacity)
+    out = torch.zeros(positions.shape[0], dtype=torch.bool, device=positions.device)
+    if not bool(inside.any()):
+        return out
+    idx = py[inside].long() * width + px[inside].long()
+    near = buf[idx]
+    lim = float(tol) + float(rel_tol) * z[inside].abs()
+    out[inside] = z[inside] <= near + lim
+    return out
+
+
 def view_weight(positions, normals, cam_pos, cam_target, fov_deg, width, height,
-                grid=None, sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06):
+                grid=None, sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06,
+                opacities=None, use_zbuffer=True, depth_tol=0.05, depth_buf=None):
     """How far a gaussian's sample from one camera should be trusted. -> (N,) >= 0
 
     Three independent terms, each a real failure mode:
@@ -844,7 +891,16 @@ def view_weight(positions, normals, cam_pos, cam_target, fov_deg, width, height,
         facing = (normals * dir_cam).sum(-1).abs()      # abs: surfel orientation is arbitrary
         w = w * (facing - min_facing).clamp_min(0.0) / max(1.0 - min_facing, 1e-6)
 
-    if grid is not None:
+    if use_zbuffer:
+        # exact first-surface test; strictly better than marching the density
+        # field, which passed surfaces metres apart as equally visible
+        # `depth_buf` must be built from the WHOLE scene. Building it from the
+        # queried subset makes every queried gaussian trivially the nearest,
+        # which silently disables occlusion instead of erroring.
+        w = w * surface_mask(positions, cam_pos, cam_target, fov_deg, width, height,
+                             opacities=opacities, tol=depth_tol,
+                             buf=depth_buf).to(w.dtype)
+    elif grid is not None:
         eps = grid.voxel_size * 1.5
         origin = positions + dir_cam * eps
         reach = (dist.reshape(-1) - eps).clamp_min(0.0)
@@ -858,11 +914,16 @@ def view_weight(positions, normals, cam_pos, cam_target, fov_deg, width, height,
 
 
 def backproject(images, cameras, positions, normals=None, grid=None, fov_deg=55.0,
-                sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06):
+                sigma=8.0, steps=24, min_facing=0.05, edge_fade=0.06, masks=None):
     """Gather per-gaussian values from a set of rendered views.
 
     `images`  : list of (H,W,C) tensors, one per view, all sharing C
     `cameras` : list of (cam_pos, cam_target) in the splat frame
+    `masks`   : optional list of (N,) bool, which gaussians each view actually
+                drew. An interior view is rendered with the near wall cut away,
+                and the cut gaussians must not then sample the image they were
+                excluded from - they would collect whatever showed through the
+                hole they left.
 
     Returns (values (N,C), coverage (N,)). Coverage is the summed weight, so
     zero means the gaussian was never reliably seen and its value is a fallback
@@ -872,11 +933,13 @@ def backproject(images, cameras, positions, normals=None, grid=None, fov_deg=55.
     c = images[0].shape[2]
     num = torch.zeros(n, c, device=positions.device, dtype=positions.dtype)
     den = torch.zeros(n, device=positions.device, dtype=positions.dtype)
-    for img, (cp, ct) in zip(images, cameras):
+    for i, (img, (cp, ct)) in enumerate(zip(images, cameras)):
         h, w = img.shape[0], img.shape[1]
         wt = view_weight(positions, normals, cp, ct, fov_deg, w, h,
                          grid=grid, sigma=sigma, steps=steps,
                          min_facing=min_facing, edge_fade=edge_fade)
+        if masks is not None and masks[i] is not None:
+            wt = wt * masks[i].to(wt.dtype)
         hit = wt > 1e-6
         if not bool(hit.any()):
             continue

@@ -237,10 +237,52 @@ def test_shadow_mask():
           "blurring a constant field leaves it constant")
 
 
+def test_flat_region_mask():
+    """A fill must be kept away from object silhouettes."""
+    print("flat region mask")
+    H, W = 96, 96
+    d = torch.full((H, W), 3.0)
+    d[:, 48:] = 3.6                      # a step: two surfaces 0.6 apart
+    e = rc.edge_map(d)
+    check(e[:, 48].mean().item() > 0.9, "the depth step is detected as an edge")
+    check(e[:, :40].mean().item() < 1e-6, "flat area away from the step has no edge")
+
+    flat = rc.flat_region_mask(d, guard=7, smooth=0)
+    check(flat[:, 48].mean().item() < 1e-6, "the silhouette itself is excluded")
+    check(flat[:, 44:53].mean().item() < 1e-6, "a guard band either side is excluded")
+    check(flat[:, :35].mean().item() > 0.99, "surface interior stays available")
+    check(flat[:, 60:].mean().item() > 0.99, "the far surface interior stays available")
+
+    # empty pixels (inf) must be treated as edges, not as smooth surface
+    d2 = torch.full((H, W), 3.0)
+    d2[20:30, 20:30] = float("inf")
+    f2 = rc.flat_region_mask(d2, guard=3, smooth=0)
+    check(f2[24, 24].item() < 1e-6, "an empty hole is excluded rather than trusted")
+    check(f2[80, 80].item() > 0.99, "distant flat area is unaffected by the hole")
+
+    # combining with a shadow mask must only ever shrink it
+    sh = torch.ones(H, W)
+    both = sh * flat
+    check(bool((both <= sh + 1e-6).all()), "combining with flatness can only shrink a mask")
+
+    # smoothing is the default because a splatted depth buffer is full of holes
+    holey = torch.full((H, W), 3.0)
+    holey[::3, ::3] = float("inf")                 # scatter, not real structure
+    raw_flat = rc.flat_region_mask(holey, guard=3, smooth=0)
+    sm_flat = rc.flat_region_mask(holey, guard=3, smooth=2)
+    check(raw_flat.mean().item() < 0.05,
+          f"unsmoothed, a holey buffer rejects nearly everything ({raw_flat.mean():.3f})")
+    check(sm_flat.mean().item() > 0.8,
+          f"smoothing recovers the flat surface ({sm_flat.mean():.3f})")
+    step = torch.full((H, W), 3.0); step[:, 48:] = 3.6
+    check(rc.flat_region_mask(step, guard=5, smooth=2)[:, 48].mean().item() < 1e-6,
+          "smoothing still rejects a genuine depth step")
+
+
 def main():
     for fn in [test_projection_geometry, test_sample_image, test_near_plane_cut,
                test_backproject_constant_recovery, test_backproject_weighting,
-               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask]:
+               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:

@@ -1039,3 +1039,59 @@ def shadow_mask(shading, ratio=0.62, context=45.0, open_r=2, close_r=6, feather=
     if feather > 0:
         m = blur2d(m, feather).clamp(0, 1)
     return m, rel
+
+
+def edge_map(depth, rel_thresh=0.02, abs_thresh=0.02):
+    """Where a depth buffer breaks - object silhouettes. -> (H,W) float in {0,1}
+
+    Infinities (empty pixels) count as edges.
+    """
+    d = depth.clone()
+    finite = torch.isfinite(d)
+    fill = d[finite].max() if bool(finite.any()) else torch.tensor(1.0, device=d.device)
+    d[~finite] = fill
+    gx = torch.zeros_like(d); gy = torch.zeros_like(d)
+    gx[:, 1:] = (d[:, 1:] - d[:, :-1]).abs()
+    gy[1:, :] = (d[1:, :] - d[:-1, :]).abs()
+    g = torch.maximum(gx, gy)
+    lim = float(abs_thresh) + float(rel_thresh) * d.abs()
+    e = (g > lim).float()
+    e = torch.maximum(e, (~finite).float())
+    return e
+
+
+def flat_region_mask(depth, guard=7, rel_thresh=0.02, abs_thresh=0.02, smooth=2):
+    """Pixels safely inside a continuous surface, away from any silhouette.
+
+    A generative fill is reliable when continuing a flat surface - floor, wall -
+    and destructive when it crosses an object boundary, because it has no idea
+    the shape it is painting over was a sink pedestal. Excluding a band around
+    every depth discontinuity confines the fill to where it can only invent
+    texture, not structure.
+
+    MEASURED LIMITATION: on the real capture this is the wrong tool for keeping
+    a generative fill off objects. Even smoothed, the buffer's internal scatter
+    punches holes through the middle of a shadow region, fragmenting the mask
+    into islands - and inpainting a fragmented mask produces visible patchwork,
+    worse than no guard at all. Use it for genuine large depth steps; for
+    excluding a sink or a mirror, segment them semantically instead.
+
+    `smooth` matters and defaults on. A depth buffer splatted from gaussians is
+    not a mesh depth buffer: on a real capture only ~52% of pixels received a
+    point at 1024x768, so the raw buffer is riddled with holes and scatter and
+    68% of it reads as discontinuity - which rejected the entire mask. A
+    min-filter closes the holes toward the nearest surface and a light blur
+    removes point scatter, taking that to 12% while keeping genuine steps.
+    """
+    if smooth:
+        r = int(smooth)
+        d = depth.clone()
+        finite = torch.isfinite(d)
+        if bool(finite.any()):
+            d[~finite] = d[finite].max()
+        # min-filter (erode) closes holes toward the nearer surface
+        d = -torch.nn.functional.max_pool2d(-d[None, None], 2 * r + 1, 1, r)[0, 0]
+        depth = blur2d(d, float(r))
+    e = edge_map(depth, rel_thresh, abs_thresh)
+    grown = torch.nn.functional.max_pool2d(e[None, None], 2 * int(guard) + 1, 1, int(guard))[0, 0]
+    return 1.0 - grown

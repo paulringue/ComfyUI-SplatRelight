@@ -175,8 +175,16 @@ class Viewport {
     };
     this.setBtn = mkBtn("Set Camera", "Commit this view as the render camera");
     this.recallBtn = mkBtn("Recall", "Snap the view back to the committed camera");
+    // Recall only helps once a camera has been committed, and it returns you to
+    // whatever that camera was - which is no use if the committed shot is itself
+    // a tight close-up. Fit is the unconditional way out of a lost view: it
+    // re-centres on the splat and backs off to a framing distance, undoing
+    // exactly the pan and zoom that stranded you, while keeping the orbit angle
+    // you had chosen.
+    this.fitBtn = mkBtn("Fit", "Re-centre on the splat and back off to frame it (undo pan/zoom)");
     row.appendChild(this.setBtn);
     row.appendChild(this.recallBtn);
+    row.appendChild(this.fitBtn);
 
     const bar = document.createElement("div");
     bar.style.cssText = "font-size:10px;opacity:.6;text-align:center;font-family:sans-serif;line-height:1.3;";
@@ -205,6 +213,10 @@ class Viewport {
     this.recallBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.recallCamera();
+    });
+    this.fitBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.fitView();
     });
 
     this.initGL();
@@ -257,6 +269,30 @@ class Viewport {
     this.draw();
   }
 
+  fitView() {
+    // Undo exactly the two things that strand a view: panning moved `centre`
+    // off the splat, and zooming changed `dist`. Both are restored to the
+    // framing the viewport opens with on a fresh load.
+    //
+    // The orbit angle is deliberately kept. Resetting it too would be a bigger
+    // surprise than the problem being fixed - you asked to get back to the
+    // splat, not to lose the direction you were looking from.
+    this.centre = this.sceneCentre.slice();
+    this.dist = this.radius / Math.tan((this.fov * Math.PI) / 360) * 1.15;
+    this.sync();
+    this.refreshButtons();
+    this.draw();
+    // Positive confirmation: with the angle preserved, a fit can otherwise look
+    // like nothing happened when the view was only slightly off.
+    const b = this.fitBtn;
+    b.textContent = "Fitted ✓";
+    b.style.background = "#2f7d4f";
+    b.style.borderColor = "rgba(130,235,170,.75)";
+    b.style.color = "#eafff2";
+    clearTimeout(this._fitTimer);
+    this._fitTimer = setTimeout(() => this.refreshButtons(), 1000);
+  }
+
   recallCamera() {
     if (!this.committed) return;
     const off = sub(this.committed.position, this.committed.target);
@@ -278,6 +314,16 @@ class Viewport {
     this.setBtn.textContent = dirty ? "Set Camera •" : "Set Camera";
     this.recallBtn.disabled = !this.committed;
     this.recallBtn.style.opacity = this.committed ? "1" : ".45";
+    // Fit is always available - it is the escape hatch, so it must never be the
+    // thing that is greyed out when the view is lost.
+    if (this.fitBtn) {
+      this.fitBtn.textContent = "Fit";
+      this.fitBtn.style.background = "#2a2d36";
+      this.fitBtn.style.borderColor = "rgba(255,255,255,.18)";
+      this.fitBtn.style.color = "#dfe2ea";
+      this.fitBtn.disabled = false;
+      this.fitBtn.style.opacity = "1";
+    }
   }
 
   initGL() {

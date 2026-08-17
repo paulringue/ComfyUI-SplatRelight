@@ -293,10 +293,45 @@ def test_flat_region_mask():
           "smoothing still rejects a genuine depth step")
 
 
+def test_split_fill_mask():
+    """Generate and blend masks must be decoupled, with the ramp contained."""
+    print("split fill mask")
+    H, W = 160, 160
+    core = torch.zeros(H, W)
+    core[60:100, 60:100] = 1.0
+    gen, blend = rc.split_fill_mask(core, blend_sigma=6.0)
+
+    check(gen.sum().item() > core.sum().item(),
+          "the generate mask is larger than the core region")
+    check(blend.max().item() > 0.95, "the blend mask still reaches full strength inside")
+    check(blend[78, 78].item() > 0.95, "core centre blends at full strength")
+
+    # THE critical invariant: the ramp must never exceed the generated area,
+    # or the composite pulls in the model's reconstruction of untouched surface
+    leak = float(((blend > 1e-4) & (gen < 0.5)).sum())
+    check(leak == 0, f"blend ramp is fully contained by the generate mask (leak {leak:.0f} px)")
+
+    # there must actually be a soft ramp, not a step
+    soft = float(((blend > 0.05) & (blend < 0.95)).sum())
+    check(soft > 500, f"a genuine soft ramp exists ({soft:.0f} px in transition)")
+
+    # a wider sigma must widen the ramp and the generated area together
+    g2, b2 = rc.split_fill_mask(core, blend_sigma=14.0)
+    soft2 = float(((b2 > 0.05) & (b2 < 0.95)).sum())
+    check(soft2 > soft, "a larger sigma widens the transition")
+    check(g2.sum().item() > gen.sum().item(), "a larger sigma also widens the generate mask")
+    check(float(((b2 > 1e-4) & (g2 < 0.5)).sum()) == 0,
+          "containment still holds at the larger sigma")
+
+    # empty input must not blow up
+    ge, be = rc.split_fill_mask(torch.zeros(H, W), blend_sigma=6.0)
+    check(float(ge.sum()) == 0 and float(be.sum()) == 0, "an empty region yields empty masks")
+
+
 def main():
     for fn in [test_projection_geometry, test_sample_image, test_near_plane_cut,
                test_backproject_constant_recovery, test_backproject_weighting,
-               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask]:
+               test_backproject_occlusion, test_orbit_cameras, test_shadow_mask, test_flat_region_mask, test_split_fill_mask]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAIL:

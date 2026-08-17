@@ -490,6 +490,16 @@ class CropSplat(IO.ComfyNode):
     @classmethod
     def execute(cls, splat, shape, centre_x, centre_y, centre_z, size_x, size_y, size_z,
                 invert, crop=None, camera_info=None) -> IO.NodeOutput:
+        # Splat Viewport reports whether its crop gizmo is actually switched on.
+        # Ignoring that flag meant turning "show crop" off in the viewport still
+        # cropped - and silently, because the viewport then stopped drawing the
+        # box that would have shown you what was being cut. On a room capture
+        # the default box sits in the middle of a hollow shell, i.e. in mid-air,
+        # so the result was an almost empty splat and a preview showing nothing.
+        if crop is not None and not crop.get("enabled", True):
+            kept = sum(_real_len(splat, i) for i in range(splat.positions.shape[0]))
+            logging.info(f"Crop Splat: gizmo off, passing through {kept:,} gaussians")
+            return IO.NodeOutput(splat, kept)
         if crop:
             shape = str(crop.get("shape", shape))
             c = crop.get("centre") or [centre_x, centre_y, centre_z]
